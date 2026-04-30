@@ -12,9 +12,9 @@
     "build": "pnpm --filter functions build",
     "watch": "pnpm --filter functions watch",
     "emu": "firebase emulators:start --only auth,functions,firestore",
-    "deploy": "pnpm --filter functions build && firebase deploy --only functions,firestore",
-    "deploy:rules": "firebase deploy --only firestore:rules",
-    "deploy:functions": "pnpm --filter functions build && firebase deploy --only functions"
+    "release": "pnpm --filter functions build && firebase deploy --only functions,firestore",
+    "release:rules": "firebase deploy --only firestore:rules",
+    "release:functions": "pnpm --filter functions build && firebase deploy --only functions"
   },
   "devDependencies": {
     "firebase-tools": "^13.28.0"

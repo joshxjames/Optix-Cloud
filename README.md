@@ -103,10 +103,13 @@ should appear under `users/<uid>/usage/<yyyy-mm>` in the Firestore emulator.
 ## Deploy
 
 ```bash
-pnpm deploy              # functions + firestore rules
-pnpm deploy:functions    # functions only
-pnpm deploy:rules        # firestore rules only
+pnpm release             # functions + firestore rules
+pnpm release:functions   # functions only
+pnpm release:rules       # firestore rules only
 ```
+
+(`deploy` is reserved by pnpm itself for a different command — that's why
+the script is named `release`.)
 
 The first deploy takes ~3–5 minutes (Cloud Functions Gen 2 provisions the
 underlying Cloud Run service). Subsequent deploys are faster.

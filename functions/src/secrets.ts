@@ -17,7 +17,8 @@ import { defineSecret } from 'firebase-functions/params';
  *  relay only calls `/v1/messages`. */
 export const ANTHROPIC_API_KEY = defineSecret('ANTHROPIC_API_KEY');
 
-/** Stripe webhook signing secret. Used to verify the authenticity of
- *  subscription-state events before mutating user records. Wired up
- *  later when Stripe lands. */
-export const STRIPE_WEBHOOK_SECRET = defineSecret('STRIPE_WEBHOOK_SECRET');
+// Stripe webhook secret will be declared here when the billing webhook
+// lands. `defineSecret` triggers a deploy-time existence check + prompt
+// for the secret value, so we add it only when a function actually
+// consumes it — declaring it speculatively breaks non-interactive
+// deploys until the value is set.
