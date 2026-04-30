@@ -1,0 +1,41 @@
+rules_version = '2';
+
+// Optix Cloud Firestore rules.
+//
+// Posture: deny-by-default. Clients can read their own data; writes go
+// through Cloud Functions using the Admin SDK (which bypasses these
+// rules). That keeps subscription state, usage counters, and Stripe
+// idempotency entirely server-controlled — the desktop client cannot
+// mutate them directly.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users can READ their own profile + subscription state but never
+    // write it — server (Cloud Functions / Stripe webhook) controls
+    // every field. The initial profile doc is created by the auth
+    // user-create trigger (`onUserCreate` in functions/src/user-trigger.ts).
+    match /users/{userId} {
+      allow read:  if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
+
+      // Per-month usage counters. Read-only for the user (so the UI
+      // can show consumption) — written exclusively by the relay via
+      // the Admin SDK as requests stream through.
+      match /usage/{yyyymm} {
+        allow read:  if request.auth != null && request.auth.uid == userId;
+        allow write: if false;
+      }
+    }
+
+    // Stripe webhook idempotency log. Server-only; clients never see it.
+    match /stripeEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    // Default deny — anything not explicitly matched above is forbidden.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

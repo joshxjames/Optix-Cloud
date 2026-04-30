@@ -1,0 +1,33 @@
+# Node
+node_modules/
+*.log
+.DS_Store
+
+# Compiled output
+functions/lib/
+
+# Firebase
+.firebase/
+*.firebase.cache
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# Local secrets / env (NEVER commit)
+.env
+.env.local
+.env.*.local
+functions/.env
+functions/.env.local
+functions/.runtimeconfig.json
+functions/.secret.local
+
+# Editor
+.vscode/
+.idea/
+
+# pnpm
+.pnpm-store/
+
+# Local-only assistant memory + state
+.claude/

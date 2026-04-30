@@ -1,0 +1,22 @@
+{
+  "name": "optix-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optix Cloud — managed Anthropic relay + auth backend for the Optix desktop app.",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm --filter functions build",
+    "watch": "pnpm --filter functions watch",
+    "emu": "firebase emulators:start --only auth,functions,firestore",
+    "deploy": "pnpm --filter functions build && firebase deploy --only functions,firestore",
+    "deploy:rules": "firebase deploy --only firestore:rules",
+    "deploy:functions": "pnpm --filter functions build && firebase deploy --only functions"
+  },
+  "devDependencies": {
+    "firebase-tools": "^13.28.0"
+  }
+}
