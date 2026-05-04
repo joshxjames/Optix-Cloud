@@ -120,11 +120,10 @@ export const relay = onRequest(
     // both observed `usedThisMonth < cap` and both passed the gate.
     // Solve it by reserving an estimated 50k tokens up-front inside a
     // transaction — the recordUsage write at stream end then reconciles
-    // with the actual usage minus the reservation. Trade-off: a request
-    // that crashes mid-flight leaves the reservation on the counter
-    // (over-counts the user by ≤RESERVATION). That's acceptable: it
-    // fails closed (toward the cap), self-heals on the next month, and
-    // lets us keep the gate cheap (one transaction, no streaming lock).
+    // with the actual usage minus the reservation. Reservations are
+    // refunded on every abnormal exit (see refundReservation below), so
+    // crashed requests no longer leak budget — the only residual is the
+    // narrow window between the transaction commit and the refund.
     const RESERVATION = 50_000;
     const usageRef = db.doc(`users/${uid}/usage/${yyyymm}`);
     try {
@@ -136,12 +135,14 @@ export const relay = onRequest(
           (usage.outputTokens ?? 0) +
           (usage.cacheCreateTokens ?? 0) +
           (usage.cacheReadTokens ?? 0);
-        // Refuse if already at/over cap. We deliberately don't reject
-        // when (used + RESERVATION) > cap — that would lock out the
-        // last few requests of the month for everyone. Instead the
-        // reservation is allowed to push the meter slightly past cap;
-        // the next request after that hits this branch and is denied.
-        if (usedThisMonth >= cap) {
+        // Why `+ RESERVATION` rather than `>=`: each in-flight request
+        // reserves RESERVATION tokens up-front. Without this guard, N
+        // concurrent requests each see "cap not yet hit", reserve, and
+        // collectively exceed cap by N×RESERVATION. The trade-off is
+        // that we may reject the last few hundred kilo-tokens of
+        // legitimate budget when the user is near their cap —
+        // acceptable to enforce the contract.
+        if (usedThisMonth + RESERVATION > cap) {
           throw new CapExceededError(usedThisMonth, cap);
         }
         // Reserve against the input-token bucket; the post-stream
@@ -170,121 +171,142 @@ export const relay = onRequest(
       return;
     }
 
-    // ---- 3. Forward to Anthropic ------------------------------------
-    const upstream = await fetch(ANTHROPIC_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY.value(),
-        'anthropic-version':
-          (req.header('anthropic-version') as string | undefined) ??
-          '2023-06-01',
-        ...(req.header('anthropic-beta')
-          ? { 'anthropic-beta': req.header('anthropic-beta') as string }
-          : {}),
-      },
-      body: JSON.stringify(req.body),
-    });
+    // Reservation invariant — every code path past this point MUST end
+    // with either recordUsage (which nets out the reservation against
+    // real usage) or refundReservation (which fully unwinds it). The
+    // `reservationRefunded` flag is the single source of truth so the
+    // catch/finally and the success path don't double-refund.
+    let reservationRefunded = false;
+    try {
+      // ---- 3. Forward to Anthropic ----------------------------------
+      const upstream = await fetch(ANTHROPIC_URL, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY.value(),
+          'anthropic-version':
+            (req.header('anthropic-version') as string | undefined) ??
+            '2023-06-01',
+          ...(req.header('anthropic-beta')
+            ? { 'anthropic-beta': req.header('anthropic-beta') as string }
+            : {}),
+        },
+        body: JSON.stringify(req.body),
+      });
 
-    // Forward status + safe headers.
-    res.status(upstream.status);
-    upstream.headers.forEach((value, key) => {
-      const lower = key.toLowerCase();
-      // Drop hop-by-hop, Cloud-Run-specific, and (critically) the
-      // `content-encoding` header. Node's fetch() auto-decompresses
-      // upstream gzip/br bodies before handing us the byte stream, so
-      // we're forwarding plaintext — leaving the original gzip header
-      // attached makes the client's SDK try to gunzip plain JSON and
-      // fail with a Z_DATA_ERROR ("incorrect header check"). Same goes
-      // for `content-length`: it'd be wrong after decompression.
-      if (
-        lower === 'transfer-encoding' ||
-        lower === 'connection' ||
-        lower === 'content-length' ||
-        lower === 'content-encoding' ||
-        lower.startsWith('cf-') ||
-        lower.startsWith('x-served-by')
-      ) {
+      // Forward status + safe headers.
+      res.status(upstream.status);
+      upstream.headers.forEach((value, key) => {
+        const lower = key.toLowerCase();
+        // Drop hop-by-hop, Cloud-Run-specific, and (critically) the
+        // `content-encoding` header. Node's fetch() auto-decompresses
+        // upstream gzip/br bodies before handing us the byte stream, so
+        // we're forwarding plaintext — leaving the original gzip header
+        // attached makes the client's SDK try to gunzip plain JSON and
+        // fail with a Z_DATA_ERROR ("incorrect header check"). Same goes
+        // for `content-length`: it'd be wrong after decompression.
+        if (
+          lower === 'transfer-encoding' ||
+          lower === 'connection' ||
+          lower === 'content-length' ||
+          lower === 'content-encoding' ||
+          lower.startsWith('cf-') ||
+          lower.startsWith('x-served-by')
+        ) {
+          return;
+        }
+        res.setHeader(key, value);
+      });
+
+      if (!upstream.body) {
+        res.end();
+        // Empty-body upstreams (errors, 204s) never produce a usage
+        // event, so the reservation needs an explicit refund here —
+        // the finally block handles it via reservationRefunded.
         return;
       }
-      res.setHeader(key, value);
-    });
 
-    if (!upstream.body) {
-      res.end();
-      return;
-    }
+      const isStream =
+        upstream.headers.get('content-type')?.includes('text/event-stream') ??
+        false;
 
-    const isStream =
-      upstream.headers.get('content-type')?.includes('text/event-stream') ??
-      false;
+      // ---- 4. Pipe response, snoop final usage on SSE ---------------
+      let finalUsage: AnthropicUsage | null = null;
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let sseBuffer = '';
 
-    // ---- 4. Pipe response, snoop final usage on SSE -----------------
-    let finalUsage: AnthropicUsage | null = null;
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder();
-    let sseBuffer = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value) continue;
 
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!value) continue;
+          // Forward the bytes verbatim — we don't transform anything.
+          res.write(Buffer.from(value));
 
-        // Forward the bytes verbatim — we don't transform anything.
-        res.write(Buffer.from(value));
-
-        if (isStream) {
-          sseBuffer += decoder.decode(value, { stream: true });
-          // Walk completed SSE events (`data: {...}\n\n`) and pull usage
-          // out of `message_start` (initial) + `message_delta` (final).
-          let sep: number;
-          while ((sep = sseBuffer.indexOf('\n\n')) !== -1) {
-            const event = sseBuffer.slice(0, sep);
-            sseBuffer = sseBuffer.slice(sep + 2);
-            const payload = extractDataPayload(event);
-            if (!payload) continue;
-            if (payload.type === 'message_start' && payload.message?.usage) {
-              finalUsage = mergeUsage(finalUsage, payload.message.usage);
-            } else if (payload.type === 'message_delta' && payload.usage) {
-              finalUsage = mergeUsage(finalUsage, payload.usage);
+          if (isStream) {
+            sseBuffer += decoder.decode(value, { stream: true });
+            // Walk completed SSE events (`data: {...}\n\n`) and pull usage
+            // out of `message_start` (initial) + `message_delta` (final).
+            let sep: number;
+            while ((sep = sseBuffer.indexOf('\n\n')) !== -1) {
+              const event = sseBuffer.slice(0, sep);
+              sseBuffer = sseBuffer.slice(sep + 2);
+              const payload = extractDataPayload(event);
+              if (!payload) continue;
+              if (payload.type === 'message_start' && payload.message?.usage) {
+                finalUsage = mergeUsage(finalUsage, payload.message.usage);
+              } else if (payload.type === 'message_delta' && payload.usage) {
+                finalUsage = mergeUsage(finalUsage, payload.usage);
+              }
             }
           }
         }
+      } catch (err) {
+        // Reader errors are logged but not rethrown — we've already
+        // forwarded a partial response and want the finally block to
+        // refund the reservation rather than leaving the client hung.
+        logger.warn('relay stream error', { uid, err: String(err) });
       }
+
+      res.end();
+
+      // Non-streaming responses carry usage directly in the JSON body. The
+      // pass-through above means we've already forwarded it to the client;
+      // for billing we re-fetch by buffering. Skipped here for v1 — almost
+      // all Anthropic Computer Use traffic is streaming.
+      if (finalUsage) {
+        // recordUsage nets out the reservation against real usage in a
+        // single Firestore write — mark it refunded synchronously so the
+        // finally block doesn't double-refund. The await on the promise
+        // would block the response (already sent), so we fire-and-forget
+        // and accept that a write failure leaves the reservation stuck;
+        // the reservedTokens counter surfaces those for ops to clean up.
+        reservationRefunded = true;
+        void recordUsage(uid, yyyymm, finalUsage, RESERVATION).catch((err) => {
+          logger.error('relay usage write failed', { uid, err: String(err) });
+        });
+      }
+      // No-usage path falls through to the finally block, which will
+      // refund the reservation since reservationRefunded is still false.
     } catch (err) {
-      logger.warn('relay stream error', { uid, err: String(err) });
-    }
-
-    res.end();
-
-    // Non-streaming responses carry usage directly in the JSON body. The
-    // pass-through above means we've already forwarded it to the client;
-    // for billing we re-fetch by buffering. Skipped here for v1 — almost
-    // all Anthropic Computer Use traffic is streaming.
-    if (finalUsage) {
-      // Fire-and-forget; failure to log usage doesn't block the response
-      // already sent to the client. The reservation made at the gate
-      // is netted out here — input delta is `actual - RESERVATION`,
-      // and we decrement the `reservedTokens` counter symmetrically.
-      void recordUsage(uid, yyyymm, finalUsage, RESERVATION).catch((err) => {
-        logger.error('relay usage write failed', { uid, err: String(err) });
-      });
-    } else {
-      // No usage event ever arrived (stream aborted, non-streaming
-      // response, upstream error). Refund the reservation so the user
-      // isn't charged for tokens we can't account for.
-      void usageRef
-        .set(
-          {
-            inputTokens: FieldValue.increment(-RESERVATION),
-            reservedTokens: FieldValue.increment(-RESERVATION),
-          },
-          { merge: true },
-        )
-        .catch((err) => {
+      // Any error after the reservation — fetch failure, header write
+      // crash, anything not caught by the inner reader try/catch — must
+      // not leak the reservation. Log, refund (in finally), respond if
+      // we haven't already.
+      logger.error('relay post-reservation error', { uid, err: String(err) });
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'upstream_failed' });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    } finally {
+      if (!reservationRefunded) {
+        await refundReservation(uid, yyyymm, RESERVATION).catch((err) => {
           logger.error('relay reservation refund failed', { uid, err: String(err) });
         });
+      }
     }
   },
 );
@@ -390,6 +412,26 @@ async function recordUsage(
       ),
       requestCount: FieldValue.increment(1),
       lastRequestAt: Timestamp.now(),
+    },
+    { merge: true },
+  );
+}
+
+/** Fully unwind a reservation made at the gate. Used on every abnormal
+ *  exit path between the reservation transaction and recordUsage —
+ *  network failures, missing upstream body, header crashes, anything
+ *  that prevents the normal nets-out write. Idempotency is enforced by
+ *  the caller via a `reservationRefunded` flag rather than here, since
+ *  Firestore increments are not naturally idempotent. */
+async function refundReservation(
+  uid: string,
+  yyyymm: string,
+  reservation: number,
+): Promise<void> {
+  await db.doc(`users/${uid}/usage/${yyyymm}`).set(
+    {
+      inputTokens: FieldValue.increment(-reservation),
+      reservedTokens: FieldValue.increment(-reservation),
     },
     { merge: true },
   );

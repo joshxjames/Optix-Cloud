@@ -67,6 +67,19 @@ function getStripe(): Stripe {
   });
 }
 
+/** H8. Strip Stripe SDK error objects down to a small allow-listed set
+ *  of fields before logging. Stripe errors carry the full request +
+ *  response payload — including customer ids, payment-method last-4s
+ *  and email addresses — and stringifying them dumps that into Cloud
+ *  Logging where it shouldn't be. Code/message/type are enough to
+ *  diagnose the failure mode without leaking PII. */
+function sanitizeStripeError(err: unknown): { code?: string; message?: string; type?: string } {
+  if (err instanceof Stripe.errors.StripeError) {
+    return { code: err.code, message: err.message, type: err.type };
+  }
+  return { message: err instanceof Error ? err.message : String(err) };
+}
+
 function getPriceIds(): Record<Tier, string> {
   const key = STRIPE_SECRET_KEY.value();
   return key.startsWith('sk_test_') ? PRICE_IDS_TEST : PRICE_IDS_LIVE;
@@ -129,10 +142,31 @@ export const createCheckoutSession = onRequest(
     const stripe = getStripe();
 
     // ---- Find or create the Stripe customer for this Firebase user
+    //
+    // H4. Two parallel invocations of this endpoint (e.g. user
+    // double-clicks "Subscribe", or the renderer retries on a flaky
+    // network) both read `stripeCustomerId === undefined`, both call
+    // `customers.create`, and the second `set` overwrites the first —
+    // leaving an orphaned paid customer Stripe-side that we never
+    // reference again.
+    //
+    // The fix is a two-phase approach:
+    //   1. Read inside a transaction to learn the current state.
+    //   2. If we need to create, do the Stripe API call OUTSIDE the
+    //      transaction (it can take seconds, and a transaction-scoped
+    //      retry that re-runs `customers.create` would create extra
+    //      orphans on conflict).
+    //   3. Re-enter a short transaction that conditionally writes only
+    //      if the field is still empty. If a parallel call won the
+    //      race, we drop our own newly-created customer on the floor
+    //      and use theirs. That's a tolerable rare orphan vs. the
+    //      alternative of permanently splitting one user across two
+    //      customers.
     const userRef = db.doc(`users/${uid}`);
-    const userSnap = await userRef.get();
-    const userData = userSnap.data() ?? {};
-    let stripeCustomerId = userData.stripeCustomerId as string | undefined;
+    let stripeCustomerId = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      return (snap.data()?.stripeCustomerId as string | undefined) ?? null;
+    });
 
     if (!stripeCustomerId) {
       const userRecord = await auth.getUser(uid);
@@ -144,8 +178,24 @@ export const createCheckoutSession = onRequest(
         metadata: { uid },
         email: userRecord.email ?? undefined,
       });
-      stripeCustomerId = customer.id;
-      await userRef.set({ stripeCustomerId }, { merge: true });
+      stripeCustomerId = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(userRef);
+        const existing = snap.data()?.stripeCustomerId as string | undefined;
+        if (existing) {
+          // A parallel invocation beat us to the write. Use theirs;
+          // the customer we just created is now an orphan. Log it
+          // so we can spot a sustained spike (would indicate a
+          // genuine bug rather than a rare race).
+          logger.warn('createCheckoutSession: orphaned stripe customer (lost race)', {
+            uid,
+            orphanedCustomerId: customer.id,
+            winningCustomerId: existing,
+          });
+          return existing;
+        }
+        tx.set(userRef, { stripeCustomerId: customer.id }, { merge: true });
+        return customer.id;
+      });
     }
 
     // ---- Create the Checkout session -------------------------------
@@ -263,9 +313,11 @@ export const createPortalSession = onRequest(
       // We log the underlying error server-side and surface a generic
       // message so a leaked Stripe error string doesn't end up in a
       // user-facing toast.
+      // H8. Sanitize: Stripe errors otherwise dump the full request +
+      // response payload (customer ids, last-4s, etc.) into Cloud Logging.
       logger.error('billingPortal.sessions.create failed', {
         uid,
-        err: String(err),
+        err: sanitizeStripeError(err),
       });
       res.status(500).json({ error: 'portal_unavailable' });
     }
@@ -357,6 +409,11 @@ export const updateSubscription = onRequest(
           // user is billed cleanly on the next period boundary. This
           // also matches the on-screen pricing — no surprise bill.
           proration_behavior: 'create_prorations',
+          // H3. Clear any pending cancellation. A user who scheduled
+          // cancel-at-period-end and then upgraded would otherwise
+          // silently keep the cancellation; Stripe doesn't auto-reset
+          // this on plan changes.
+          cancel_at_period_end: false,
           // Keep tier metadata in sync with the new price so future
           // webhook events carry the right tier.
           metadata: { uid, tier },
@@ -394,10 +451,12 @@ export const updateSubscription = onRequest(
 
       res.status(400).json({ error: 'invalid_action' });
     } catch (err) {
+      // H8. Sanitize: don't leak Stripe error payloads (subscription
+      // ids, customer ids, idempotency keys) into logs.
       logger.error('updateSubscription failed', {
         uid,
         action: String(action),
-        err: String(err),
+        err: sanitizeStripeError(err),
       });
       res.status(500).json({ error: 'stripe_update_failed' });
     }
@@ -433,8 +492,11 @@ export const stripeWebhook = onRequest(
         STRIPE_WEBHOOK_SECRET.value(),
       );
     } catch (err) {
+      // H8. Sanitize: webhook signature failures throw a
+      // Stripe.errors.StripeSignatureVerificationError that includes
+      // the raw header + body in its detail fields.
       logger.warn('stripe webhook signature verification failed', {
-        err: String(err),
+        err: sanitizeStripeError(err),
       });
       res.status(400).send('invalid signature');
       return;
@@ -448,11 +510,19 @@ export const stripeWebhook = onRequest(
     // a transaction (read-then-write in the same tx), and bail with
     // 200 if it already exists. Doc stays after success so subsequent
     // retries also short-circuit.
+    //
+    // H7. The dedup doc also stores `eventType`. An operator with
+    // Firestore console access could otherwise pre-create
+    // `stripeEvents/{id}` with empty contents to permanently lock out
+    // future processing of that event id (DoS). By verifying the
+    // stored type matches `event.type`, a pre-claim with no type (or
+    // a mismatched type) is treated as not-yet-processed: we
+    // overwrite and run the handler.
     const eventRef = db.doc(`stripeEvents/${event.id}`);
     try {
       const isDuplicate = await db.runTransaction(async (tx) => {
         const existing = await tx.get(eventRef);
-        if (existing.exists) return true;
+        if (existing.exists && existing.data()?.type === event.type) return true;
         tx.set(eventRef, {
           type: event.type,
           processedAt: FieldValue.serverTimestamp(),
@@ -471,9 +541,12 @@ export const stripeWebhook = onRequest(
       // Transaction failure here is itself transient; respond 500 so
       // Stripe retries — the next attempt will either claim the doc
       // cleanly or hit the duplicate branch.
+      // H8. Sanitize for consistency — this branch handles Firestore
+      // errors which don't carry Stripe payloads, but the helper is
+      // a safe pass-through for non-Stripe errors.
       logger.error('stripe webhook idempotency claim failed', {
         eventId: event.id,
-        err: String(err),
+        err: sanitizeStripeError(err),
       });
       res.status(500).json({ error: 'idempotency_claim_failed' });
       return;
@@ -487,8 +560,11 @@ export const stripeWebhook = onRequest(
       await handleStripeEvent(stripe, event);
       res.status(200).json({ received: true });
     } catch (err) {
+      // H8. Sanitize: handlers call back into Stripe (retrieve
+      // subscription / invoice etc.), so any error bubbling up here
+      // can be a Stripe error with full payload.
       logger.error('stripe webhook handler failed', {
-        err: String(err),
+        err: sanitizeStripeError(err),
         eventType: event.type,
         eventId: event.id,
       });
@@ -501,7 +577,7 @@ export const stripeWebhook = onRequest(
       eventRef.delete().catch((delErr) => {
         logger.error('stripe webhook idempotency rollback failed', {
           eventId: event.id,
-          err: String(delErr),
+          err: sanitizeStripeError(delErr),
         });
       });
       // 500 prompts Stripe to retry; this is the right behaviour for
@@ -581,6 +657,18 @@ async function handleStripeEvent(stripe: Stripe, event: Stripe.Event): Promise<v
       await applySubscriptionState(subscription);
       return;
     }
+    case 'customer.updated': {
+      // H6. Placeholder — we don't currently track card-on-file
+      // details in Firestore (last-4, brand, exp). When we add a
+      // "manage payment method" UI we'll surface those here. For now
+      // just acknowledge the event so it shows up in Cloud Logging
+      // alongside the others rather than under the unhandled bucket.
+      const customer = event.data.object as Stripe.Customer;
+      logger.info('stripe webhook: customer.updated (no-op placeholder)', {
+        customerId: customer.id,
+      });
+      return;
+    }
     case 'invoice.payment_failed': {
       // Card declined / insufficient funds. Stripe will retry per its
       // default smart-retry schedule; until then the user is past_due.
@@ -654,15 +742,35 @@ async function applySubscriptionState(subscription: Stripe.Subscription): Promis
   // Map Stripe statuses to our internal vocabulary. We collapse
   // `trialing` → `active` because we don't currently offer trials —
   // future trial logic can split them out without breaking the relay.
+  //
+  // The mapping is exhaustive and fail-closed: any unrecognised status
+  // collapses to `'canceled'` so the relay locks the user out rather
+  // than passing through a string the rest of the system doesn't know
+  // how to render or enforce.
   const stripeStatus = subscription.status;
-  const subscriptionStatus =
-    stripeStatus === 'trialing' || stripeStatus === 'active'
-      ? 'active'
-      : stripeStatus === 'past_due'
-        ? 'past_due'
-        : stripeStatus === 'canceled' || stripeStatus === 'unpaid'
-          ? 'canceled'
-          : stripeStatus;
+  let subscriptionStatus: 'active' | 'past_due' | 'canceled';
+  if (stripeStatus === 'trialing' || stripeStatus === 'active') {
+    subscriptionStatus = 'active';
+  } else if (stripeStatus === 'past_due') {
+    subscriptionStatus = 'past_due';
+  } else if (stripeStatus === 'incomplete' || stripeStatus === 'incomplete_expired') {
+    // Initial payment never confirmed (3DS abandoned, card declined
+    // on first charge). Treat as past_due — locks the user out, but
+    // leaves a hook for a future "complete your subscription" banner
+    // that distinguishes this from a mid-cycle failure.
+    subscriptionStatus = 'past_due';
+  } else if (stripeStatus === 'canceled' || stripeStatus === 'unpaid') {
+    subscriptionStatus = 'canceled';
+  } else {
+    // `paused` and anything Stripe adds in a future API version land
+    // here. Fail closed and leave breadcrumbs.
+    logger.warn('subscription has unrecognised stripe status — failing closed', {
+      subscriptionId: subscription.id,
+      uid,
+      stripeStatus,
+    });
+    subscriptionStatus = 'canceled';
+  }
 
   // current_period_end on Subscription is a Unix-seconds timestamp.
   // Stored as a Firestore Timestamp so server-side queries can compare
@@ -681,7 +789,19 @@ async function applySubscriptionState(subscription: Stripe.Subscription): Promis
     (subscription as unknown as { cancel_at_period_end?: boolean }).cancel_at_period_end,
   );
 
-  await db.doc(`users/${uid}`).set(
+  // If the user previously scheduled a cancellation and is now
+  // reactivating (status back to active, flag cleared), wipe the
+  // stale `canceledAt` timestamp so the user doc isn't misleading
+  // about whether the subscription is ending. Read the prior state
+  // first so we only delete when there's something to delete and we
+  // can detect the cancel→active transition.
+  const userRef = db.doc(`users/${uid}`);
+  const priorSnap = await userRef.get();
+  const priorCancelAtPeriodEnd = Boolean(priorSnap.data()?.cancelAtPeriodEnd);
+  const reactivated =
+    subscriptionStatus === 'active' && priorCancelAtPeriodEnd && !cancelAtPeriodEnd;
+
+  await userRef.set(
     {
       tier,
       subscriptionStatus,
@@ -689,6 +809,7 @@ async function applySubscriptionState(subscription: Stripe.Subscription): Promis
       cancelAtPeriodEnd,
       tokenAllowanceMonthly: allowance,
       stripeSubscriptionId: subscription.id,
+      ...(reactivated ? { canceledAt: FieldValue.delete() } : {}),
     },
     { merge: true },
   );
