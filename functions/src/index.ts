@@ -8,7 +8,7 @@
 //   - stripeWebhook          : HTTPS — Stripe → subscription state in Firestore
 
 export { relay } from './relay.js';
-export { onUserCreate } from './user-trigger.js';
+export { onUserCreate, onUserDelete } from './user-trigger.js';
 export {
   createCheckoutSession,
   createPortalSession,
