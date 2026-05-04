@@ -17,8 +17,14 @@ import { defineSecret } from 'firebase-functions/params';
  *  relay only calls `/v1/messages`. */
 export const ANTHROPIC_API_KEY = defineSecret('ANTHROPIC_API_KEY');
 
-// Stripe webhook secret will be declared here when the billing webhook
-// lands. `defineSecret` triggers a deploy-time existence check + prompt
-// for the secret value, so we add it only when a function actually
-// consumes it — declaring it speculatively breaks non-interactive
-// deploys until the value is set.
+/** Stripe secret API key. The mode (`sk_test_...` vs `sk_live_...`) is
+ *  inferred from the value's prefix at request time, which selects the
+ *  matching price-ID catalog inside `stripe.ts`. Swapping test → live
+ *  is a single secret rotation, no code change. */
+export const STRIPE_SECRET_KEY = defineSecret('STRIPE_SECRET_KEY');
+
+/** Stripe webhook signing secret. Stripe gives a separate `whsec_...`
+ *  per registered webhook endpoint AND per mode (test/live), so when
+ *  flipping modes you need to re-register the endpoint and rotate this
+ *  secret too. */
+export const STRIPE_WEBHOOK_SECRET = defineSecret('STRIPE_WEBHOOK_SECRET');

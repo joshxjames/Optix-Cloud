@@ -69,6 +69,18 @@ export const relay = onRequest(
       return;
     }
 
+    // ---- M3. Body size guard ----------------------------------------
+    // Anthropic itself rejects oversized prompts, but by then we've
+    // already buffered and re-serialised the body and burned CPU on
+    // upstream TLS. Reject at the door for anything claiming >5MB —
+    // a generous upper bound for legitimate Computer Use payloads
+    // (screenshots are sent inline as base64).
+    const contentLength = Number(req.header('content-length') ?? '0');
+    if (contentLength > 5_000_000) {
+      res.status(413).json({ error: 'request_too_large' });
+      return;
+    }
+
     // ---- 1. Auth -----------------------------------------------------
     const uid = await verifyBearer(req, res);
     if (!uid) return;
@@ -89,22 +101,73 @@ export const relay = onRequest(
     }
     const cap = (userData.tokenAllowanceMonthly as number | undefined) ?? 0;
     const yyyymm = monthKey(new Date());
-    if (cap > 0) {
-      const usageSnap = await db.doc(`users/${uid}/usage/${yyyymm}`).get();
-      const usage = usageSnap.data() ?? {};
-      const usedThisMonth =
-        (usage.inputTokens ?? 0) +
-        (usage.outputTokens ?? 0) +
-        (usage.cacheCreateTokens ?? 0) +
-        (usage.cacheReadTokens ?? 0);
-      if (usedThisMonth >= cap) {
+
+    // ---- H3. Cap-required gate --------------------------------------
+    // An `active` subscription with no allowance is a billing-state bug
+    // (e.g. webhook landed mid-mutation) — fail closed rather than
+    // letting the user burn unmetered tokens. A real bypass would have
+    // to be done by an operator deliberately setting the allowance.
+    if (cap <= 0) {
+      res.status(402).json({
+        error: 'subscription_incomplete',
+        reason: 'no_token_allowance',
+      });
+      return;
+    }
+
+    // ---- H1. Atomic cap check + reservation -------------------------
+    // The previous read-then-increment was racy: two concurrent requests
+    // both observed `usedThisMonth < cap` and both passed the gate.
+    // Solve it by reserving an estimated 50k tokens up-front inside a
+    // transaction — the recordUsage write at stream end then reconciles
+    // with the actual usage minus the reservation. Trade-off: a request
+    // that crashes mid-flight leaves the reservation on the counter
+    // (over-counts the user by ≤RESERVATION). That's acceptable: it
+    // fails closed (toward the cap), self-heals on the next month, and
+    // lets us keep the gate cheap (one transaction, no streaming lock).
+    const RESERVATION = 50_000;
+    const usageRef = db.doc(`users/${uid}/usage/${yyyymm}`);
+    try {
+      await db.runTransaction(async (tx) => {
+        const usageSnap = await tx.get(usageRef);
+        const usage = usageSnap.data() ?? {};
+        const usedThisMonth =
+          (usage.inputTokens ?? 0) +
+          (usage.outputTokens ?? 0) +
+          (usage.cacheCreateTokens ?? 0) +
+          (usage.cacheReadTokens ?? 0);
+        // Refuse if already at/over cap. We deliberately don't reject
+        // when (used + RESERVATION) > cap — that would lock out the
+        // last few requests of the month for everyone. Instead the
+        // reservation is allowed to push the meter slightly past cap;
+        // the next request after that hits this branch and is denied.
+        if (usedThisMonth >= cap) {
+          throw new CapExceededError(usedThisMonth, cap);
+        }
+        // Reserve against the input-token bucket; the post-stream
+        // recordUsage subtracts RESERVATION from the actual input
+        // delta to net it out.
+        tx.set(
+          usageRef,
+          {
+            inputTokens: FieldValue.increment(RESERVATION),
+            reservedTokens: FieldValue.increment(RESERVATION),
+          },
+          { merge: true },
+        );
+      });
+    } catch (err) {
+      if (err instanceof CapExceededError) {
         res.status(429).json({
           error: 'monthly_allowance_exceeded',
-          used: usedThisMonth,
-          cap,
+          used: err.used,
+          cap: err.cap,
         });
         return;
       }
+      logger.error('relay cap-check transaction failed', { uid, err: String(err) });
+      res.status(500).json({ error: 'cap_check_failed' });
+      return;
     }
 
     // ---- 3. Forward to Anthropic ------------------------------------
@@ -127,12 +190,18 @@ export const relay = onRequest(
     res.status(upstream.status);
     upstream.headers.forEach((value, key) => {
       const lower = key.toLowerCase();
-      // Drop hop-by-hop and Cloud-Run-specific headers; let Cloud Run
-      // add its own back as needed.
+      // Drop hop-by-hop, Cloud-Run-specific, and (critically) the
+      // `content-encoding` header. Node's fetch() auto-decompresses
+      // upstream gzip/br bodies before handing us the byte stream, so
+      // we're forwarding plaintext — leaving the original gzip header
+      // attached makes the client's SDK try to gunzip plain JSON and
+      // fail with a Z_DATA_ERROR ("incorrect header check"). Same goes
+      // for `content-length`: it'd be wrong after decompression.
       if (
         lower === 'transfer-encoding' ||
         lower === 'connection' ||
         lower === 'content-length' ||
+        lower === 'content-encoding' ||
         lower.startsWith('cf-') ||
         lower.startsWith('x-served-by')
       ) {
@@ -195,10 +264,27 @@ export const relay = onRequest(
     // all Anthropic Computer Use traffic is streaming.
     if (finalUsage) {
       // Fire-and-forget; failure to log usage doesn't block the response
-      // already sent to the client.
-      void recordUsage(uid, yyyymm, finalUsage).catch((err) => {
+      // already sent to the client. The reservation made at the gate
+      // is netted out here — input delta is `actual - RESERVATION`,
+      // and we decrement the `reservedTokens` counter symmetrically.
+      void recordUsage(uid, yyyymm, finalUsage, RESERVATION).catch((err) => {
         logger.error('relay usage write failed', { uid, err: String(err) });
       });
+    } else {
+      // No usage event ever arrived (stream aborted, non-streaming
+      // response, upstream error). Refund the reservation so the user
+      // isn't charged for tokens we can't account for.
+      void usageRef
+        .set(
+          {
+            inputTokens: FieldValue.increment(-RESERVATION),
+            reservedTokens: FieldValue.increment(-RESERVATION),
+          },
+          { merge: true },
+        )
+        .catch((err) => {
+          logger.error('relay reservation refund failed', { uid, err: String(err) });
+        });
     }
   },
 );
@@ -234,12 +320,20 @@ function extractDataPayload(event: string): any | null {
   // Anthropic SSE events look like:
   //   event: message_delta
   //   data: {"type": "message_delta", "usage": {...}}
-  // We only care about the `data:` line for parsing.
+  // We only care about the `data:` line for parsing, AND we only ever
+  // return payloads whose type is on our usage-snoop whitelist
+  // (message_start / message_delta). Defence-in-depth — if a future
+  // caller forgets to type-check the result, content blocks from other
+  // event kinds still won't leak out of this helper.
   for (const line of event.split('\n')) {
     if (line.startsWith('data: ')) {
       const json = line.slice('data: '.length);
       try {
-        return JSON.parse(json);
+        const parsed = JSON.parse(json);
+        if (parsed?.type === 'message_start' || parsed?.type === 'message_delta') {
+          return parsed;
+        }
+        return null;
       } catch {
         return null;
       }
@@ -276,10 +370,17 @@ async function recordUsage(
   uid: string,
   yyyymm: string,
   usage: AnthropicUsage,
+  reservation: number,
 ): Promise<void> {
+  // We pre-incremented `inputTokens` by `reservation` at the gate, so
+  // the actual delta to write here is the real input tokens MINUS the
+  // reservation. The reservedTokens counter is decremented in lock-step
+  // so it stays at zero in steady state — non-zero values flag stuck
+  // reservations from crashed requests.
   await db.doc(`users/${uid}/usage/${yyyymm}`).set(
     {
-      inputTokens: FieldValue.increment(usage.input_tokens ?? 0),
+      inputTokens: FieldValue.increment((usage.input_tokens ?? 0) - reservation),
+      reservedTokens: FieldValue.increment(-reservation),
       outputTokens: FieldValue.increment(usage.output_tokens ?? 0),
       cacheCreateTokens: FieldValue.increment(
         usage.cache_creation_input_tokens ?? 0,
@@ -294,20 +395,31 @@ async function recordUsage(
   );
 }
 
+/** Sentinel error thrown from the cap-check transaction so we can map
+ *  it back to a 429 outside without conflating with Firestore failures. */
+class CapExceededError extends Error {
+  constructor(
+    public readonly used: number,
+    public readonly cap: number,
+  ) {
+    super('cap_exceeded');
+  }
+}
+
 function monthKey(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
 function isAllowedOrigin(origin: string): boolean {
-  // Electron in packaged form has origin `file://`, dev has
-  // `http://localhost:5174`, the future marketing site is on Firebase
-  // Hosting. We don't allow arbitrary browsers — that prevents random
-  // websites from spending tokens on a leaked Bearer token.
+  // Electron in packaged form has origin `file://` (or empty in some
+  // versions), dev has `http://localhost:5174`. We deliberately do NOT
+  // allow `*.firebaseapp.com` / `*.web.app` here — those cover every
+  // Firebase Hosting project on the planet, and a leaked Bearer token
+  // would be spendable from any of them. When we have a specific
+  // marketing-site origin to ship, add it here by exact host.
   if (!origin) return true; // Some Electron versions send empty origin
   if (origin === 'file://') return true;
   if (origin.startsWith('http://localhost:')) return true;
   if (origin.startsWith('http://127.0.0.1:')) return true;
-  if (origin.endsWith('.firebaseapp.com')) return true;
-  if (origin.endsWith('.web.app')) return true;
   return false;
 }

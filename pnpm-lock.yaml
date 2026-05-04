@@ -20,6 +20,9 @@ importers:
       firebase-functions:
         specifier: ^6.1.1
         version: 6.6.0(firebase-admin@12.7.0)
+      stripe:
+        specifier: ^22.1.0
+        version: 22.1.0(@types/node@22.19.17)
     devDependencies:
       '@types/express':
         specifier: ^4.17.21
@@ -2119,6 +2122,15 @@ packages:
   strip-json-comments@2.0.1:
     resolution: {integrity: sha512-4gB8na07fecVVkOI6Rs4e7T6NOTki5EmL7TUduTs6bu3EdnSycntVJ4re8kgZA+wx9IueI2Y11bfbgwtzuE0KQ==}
     engines: {node: '>=0.10.0'}
+
+  stripe@22.1.0:
+    resolution: {integrity: sha512-w/xHyJGxXWnLPbNHG13sz/fae0MrFGC80Oz7YbICQymbfpqfEcsoG+6yG+9BWb81PWc4rrkeSO4wmTcmefmbLw==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      '@types/node': '>=18'
+    peerDependenciesMeta:
+      '@types/node':
+        optional: true
 
   strnum@2.2.3:
     resolution: {integrity: sha512-oKx6RUCuHfT3oyVjtnrmn19H1SiCqgJSg+54XqURKp5aCMbrXrhLjRN9TjuwMjiYstZ0MzDrHqkGZ5dFTKd+zg==}
@@ -4808,6 +4820,10 @@ snapshots:
       ansi-regex: 6.2.2
 
   strip-json-comments@2.0.1: {}
+
+  stripe@22.1.0(@types/node@22.19.17):
+    optionalDependencies:
+      '@types/node': 22.19.17
 
   strnum@2.2.3:
     optional: true

@@ -2,8 +2,16 @@
 // can find them. Adding a new function = importing it here.
 //
 // Layout:
-//   - relay         : HTTPS function — the Anthropic streaming proxy
-//   - onUserCreate  : Auth trigger — seeds Firestore profile on signup
+//   - relay                  : HTTPS — the Anthropic streaming proxy
+//   - onUserCreate           : Auth trigger — seeds Firestore profile on signup
+//   - createCheckoutSession  : HTTPS — desktop client → Stripe Checkout URL
+//   - stripeWebhook          : HTTPS — Stripe → subscription state in Firestore
 
 export { relay } from './relay.js';
 export { onUserCreate } from './user-trigger.js';
+export {
+  createCheckoutSession,
+  createPortalSession,
+  stripeWebhook,
+  updateSubscription,
+} from './stripe.js';
