@@ -28,3 +28,8 @@ export const STRIPE_SECRET_KEY = defineSecret('STRIPE_SECRET_KEY');
  *  flipping modes you need to re-register the endpoint and rotate this
  *  secret too. */
 export const STRIPE_WEBHOOK_SECRET = defineSecret('STRIPE_WEBHOOK_SECRET');
+
+/** SMTP password for the Rackspace mailbox the support form sends from
+ *  (`admin@covetable.com.au`). Used by `submitFeedback.ts` via
+ *  nodemailer to deliver in-app feedback messages. */
+export const SMTP_PASSWORD = defineSecret('SMTP_PASSWORD');
