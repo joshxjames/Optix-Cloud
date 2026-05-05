@@ -70,12 +70,23 @@ function isRateLimited(ip: string): boolean {
 }
 
 /** Validate the incoming JSON body. Returns the typed payload on
- *  success or `null` on any malformation — we don't surface the
- *  specific error to the client (could leak internals); `null` →
- *  caller returns 400. */
-function parsePayload(body: unknown): FeedbackPayload | null {
+ *  success, `'honeypot'` if the bot trap fired, or `null` on any other
+ *  malformation. We don't surface the specific error to the client
+ *  (could leak internals); `null` -> caller returns 400. The honeypot
+ *  case is silent: the CF returns 200 like a successful submit so bots
+ *  don't adapt their field names looking for one we accept. */
+function parsePayload(body: unknown): FeedbackPayload | 'honeypot' | null {
   if (typeof body !== 'object' || body === null) return null;
   const b = body as Record<string, unknown>;
+
+  // Honeypot — silent reject. Real human submissions either omit this
+  // field or send an empty string; bots that auto-fill every input
+  // populate it with their default text. See the website's contact
+  // form (and the desktop SupportForm), both of which include an
+  // off-screen "website" input named to attract bot autofill.
+  if (typeof b.honeypot === 'string' && b.honeypot.length > 0) {
+    return 'honeypot';
+  }
 
   if (typeof b.name !== 'string' || b.name.length > 120) return null;
   if (
@@ -157,6 +168,13 @@ export const submitFeedback = onRequest(
 
     // --- Validate body ---
     const payload = parsePayload(req.body);
+    if (payload === 'honeypot') {
+      // Silent reject — log internally but pretend success so bots
+      // don't iterate their honeypot-evasion strategy.
+      logger.info(`[submitFeedback] honeypot caught a bot ip=${ip}`);
+      res.status(200).json({ ok: true });
+      return;
+    }
     if (!payload) {
       logger.warn(`[submitFeedback] invalid payload from ip=${ip}`);
       res.status(400).json({ ok: false, error: 'invalid_payload' });
