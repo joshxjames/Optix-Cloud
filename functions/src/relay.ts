@@ -23,6 +23,22 @@ import { ANTHROPIC_API_KEY } from './secrets.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 
+// Server-side model whitelist for the Optix Cloud subscription tier.
+// The desktop UI catalog (`optix/desktop/src/shared/models.ts` →
+// `optixCloud`) is the soft policy; this is the hard gate. Sonnet,
+// Haiku, and any other Anthropic model are NOT served on the
+// subscription path — those users must use BYO key.
+//
+// Prefix-matched so dated snapshots (e.g. `claude-opus-4-7-20250115`)
+// automatically pass when Anthropic publishes them, without requiring
+// a relay redeploy. Keep entries to base IDs only.
+const ALLOWED_MODEL_PREFIXES = ['claude-opus-4-7'] as const;
+
+function isAllowedModel(model: unknown): model is string {
+  if (typeof model !== 'string' || model.length === 0) return false;
+  return ALLOWED_MODEL_PREFIXES.some((prefix) => model.startsWith(prefix));
+}
+
 type AnthropicUsage = {
   input_tokens?: number;
   output_tokens?: number;
@@ -78,6 +94,27 @@ export const relay = onRequest(
     const contentLength = Number(req.header('content-length') ?? '0');
     if (contentLength > 5_000_000) {
       res.status(413).json({ error: 'request_too_large' });
+      return;
+    }
+
+    // ---- Model whitelist --------------------------------------------
+    // Optix Cloud sells a single model — Claude Opus 4.7. Reject any
+    // other model BEFORE any Firestore round-trips, both to save quota
+    // and to give the client a fast, clear error. Anthropic itself
+    // would happily serve any of their models with our admin key, so
+    // this check is the only thing keeping subscription users on
+    // Opus 4.7. (The desktop UI also restricts the choice — see
+    // `optix/desktop/src/shared/models.ts` `optixCloud`.)
+    const requestedModel = (req.body as { model?: unknown })?.model;
+    if (!isAllowedModel(requestedModel)) {
+      res.status(400).json({
+        error: 'model_not_allowed',
+        message:
+          'Optix Cloud only relays Claude Opus 4.7. Switch to Opus, ' +
+          'or use BYO key for other models.',
+        allowed: ALLOWED_MODEL_PREFIXES,
+        requested: typeof requestedModel === 'string' ? requestedModel : null,
+      });
       return;
     }
 
