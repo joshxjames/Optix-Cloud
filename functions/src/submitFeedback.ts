@@ -1,5 +1,5 @@
 // In-app support form receiver. The desktop widget POSTs feedback
-// payloads here; we send them by email to admin@covetable.com.au via
+// payloads here; we send them by email to support@covetable.com.au via
 // nodemailer using SMTP credentials stored in Firebase Functions secrets.
 //
 // Auth: optional. Optix Cloud users include a Firebase ID token via
@@ -20,8 +20,8 @@ import { SMTP_PASSWORD } from './secrets.js';
 
 const SMTP_HOST = 'secure.emailsrvr.com';
 const SMTP_PORT = 465;
-const SMTP_USER = 'admin@covetable.com.au';
-const SUPPORT_TO = 'admin@covetable.com.au';
+const SMTP_USER = 'support@covetable.com.au';
+const SUPPORT_TO = 'support@covetable.com.au';
 
 const FEEDBACK_CATEGORIES = [
   'Bug report',
